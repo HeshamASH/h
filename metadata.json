@@ -1,0 +1,5 @@
+{
+  "name": "Elastic CodeMind",
+  "description": "An intelligent, conversational AI assistant that uses Elastic's hybrid search to provide context-aware answers about a codebase, powered by Google's Gemini Pro.",
+  "requestFramePermissions": []
+}
