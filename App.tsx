@@ -1,429 +1,352 @@
-import React, { useState, useCallback, useEffect } from 'react';
-import { ChatMessage, MessageRole, Source, AppMode, ElasticResult, Intent, CodeSuggestion, ModelId, MODELS, ResponseType, FileViewType } from './types';
-import { searchDocuments, getAllFiles, getFileContent, createDatasetFromFileList, updateFileContent } from './services/elasticService';
-import { streamAiResponse, classifyIntent, streamChitChatResponse, streamCodeGenerationResponse, classifyFileContent } from './services/geminiService';
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  AppMode,
+  ChatMessage,
+  MessageRole,
+  Source,
+  ElasticResult,
+  Intent,
+  ResponseType,
+  CodeSuggestion,
+  ModelId,
+  MODELS,
+  FileViewType,
+} from './types';
+
+import * as elastic from './services/elasticService';
+import * as gemini from './services/geminiService';
+
 import Header from './components/Header';
 import ChatInterface from './components/ChatInterface';
-import FileSearch from './components/FileSearch';
 import FileViewer from './components/FileViewer';
+import FileSearch from './components/FileSearch';
 import EditedFilesViewer from './components/EditedFilesViewer';
 import DiffViewerModal from './components/DiffViewerModal';
 
-const HISTORY_KEY = 'elastic-codemind-history';
-
-export interface EditedFileRecord {
+// This is also defined in DiffViewerModal and EditedFilesViewer,
+// but not exported. Defining it here to manage state.
+interface EditedFileRecord {
   file: Source;
   originalContent: string;
   currentContent: string;
 }
 
+// Main App component
 const App: React.FC = () => {
+  // State variables
   const [mode, setMode] = useState<AppMode>(AppMode.CODEBASE);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [allFiles, setAllFiles] = useState<Source[]>([]);
-  const [isFileSearchVisible, setIsFileSearchVisible] = useState<boolean>(false);
-  const [isEditedFilesVisible, setIsEditedFilesVisible] = useState<boolean>(false);
-  const [editedFiles, setEditedFiles] = useState<Map<string, EditedFileRecord>>(new Map());
-  const [selectedFile, setSelectedFile] = useState<Source | null>(null);
-  const [selectedFileContent, setSelectedFileContent] = useState<string>('');
-  const [selectedFileViewType, setSelectedFileViewType] = useState<FileViewType | null>(null);
   const [customDataset, setCustomDataset] = useState<ElasticResult[]>([]);
+  
+  const [isShowingFileSearch, setIsShowingFileSearch] = useState<boolean>(false);
+  const [isShowingEditedFiles, setIsShowingEditedFiles] = useState<boolean>(false);
+
+  const [selectedFile, setSelectedFile] = useState<Source | null>(null);
+  const [selectedFileContent, setSelectedFileContent] = useState<string>('Loading...');
+  const [selectedFileViewType, setSelectedFileViewType] = useState<FileViewType | null>(null);
+  
+  const [editedFiles, setEditedFiles] = useState<Map<string, EditedFileRecord>>(new Map());
+  const [selectedEditedFileRecord, setSelectedEditedFileRecord] = useState<EditedFileRecord | null>(null);
+  
   const [selectedModel, setSelectedModel] = useState<ModelId>(ModelId.GEMINI_FLASH_LITE);
-  const [diffViewerRecord, setDiffViewerRecord] = useState<EditedFileRecord | null>(null);
 
-  useEffect(() => {
-    try {
-      const savedState = localStorage.getItem(HISTORY_KEY);
-      if (savedState) {
-        const { messages: savedMessages, mode: savedMode, model: savedModel } = JSON.parse(savedState);
-        if (savedMode !== AppMode.CUSTOM) {
-          setMessages(savedMessages || []);
-          setMode(savedMode || AppMode.CODEBASE);
-          setSelectedModel(savedModel || ModelId.GEMINI_FLASH_LITE);
-        }
-      }
-    } catch (error) {
-      console.error("Failed to parse state from localStorage", error);
-    }
-  }, []);
+  // --- Effects ---
 
-  useEffect(() => {
-    try {
-      if (mode !== AppMode.CUSTOM) {
-        const stateToSave = JSON.stringify({ messages, mode, model: selectedModel });
-        localStorage.setItem(HISTORY_KEY, stateToSave);
-      } else {
-        localStorage.removeItem(HISTORY_KEY);
-      }
-    } catch (error) {
-      console.error("Failed to save state to localStorage", error);
-    }
-  }, [messages, mode, selectedModel]);
-
-  useEffect(() => {
-    const fetchFiles = async () => {
-      try {
-        const currentDataset = mode === AppMode.CUSTOM ? customDataset : undefined;
-        const files = await getAllFiles(mode, currentDataset);
-        setAllFiles(files);
-      } catch (error) {
-        console.error("Failed to fetch file list:", error);
-      }
-    };
-    fetchFiles();
+  // Fetch all files when mode changes
+  const fetchFiles = useCallback(async () => {
+    const files = await elastic.getAllFiles(mode, mode === AppMode.CUSTOM ? customDataset : undefined);
+    setAllFiles(files);
   }, [mode, customDataset]);
 
-  const handleQueryDocuments = async (currentMessages: ChatMessage[]) => {
-    setMessages(prev => [...prev, {
-      role: MessageRole.MODEL,
-      content: '',
-      sources: [],
-      responseType: ResponseType.RAG,
-      modelId: selectedModel
-    }]);
-
-    const currentDataset = mode === AppMode.CUSTOM ? customDataset : undefined;
-    const latestQuery = currentMessages[currentMessages.length -1].content;
-    const searchResults = await searchDocuments(latestQuery, mode, currentDataset);
-    const sources: Source[] = searchResults.map(r => r.source);
-
-    const modelToUse = MODELS.find(m => m.id === selectedModel)?.model || MODELS[0].model;
-    const responseStream = await streamAiResponse(currentMessages, searchResults, mode, modelToUse);
-    
-    for await (const chunk of responseStream) {
-      const chunkText = chunk.text;
-      setMessages(prev => prev.map((msg, index) => 
-          index === prev.length - 1 
-          ? { ...msg, content: msg.content + chunkText } 
-          : msg
-      ));
-    }
-    setMessages(prev => prev.map((msg, index) =>
-        index === prev.length - 1
-          ? { ...msg, sources }
-          : msg
-    ));
+  useEffect(() => {
+    fetchFiles();
+  }, [fetchFiles]);
+  
+  // --- Handlers ---
+  
+  const handleNewChat = () => {
+    setMessages([]);
   };
   
-  const handleChitChat = async (currentMessages: ChatMessage[]) => {
-    setMessages(prev => [...prev, {
-      role: MessageRole.MODEL,
-      content: '',
-      responseType: ResponseType.CHIT_CHAT,
-      modelId: selectedModel
-    }]);
-    const modelToUse = MODELS.find(m => m.id === selectedModel)?.model || MODELS[0].model;
-    const responseStream = await streamChitChatResponse(currentMessages, modelToUse);
-    for await (const chunk of responseStream) {
-      const chunkText = chunk.text;
-      setMessages(prev => prev.map((msg, index) => 
-          index === prev.length - 1 
-          ? { ...msg, content: msg.content + chunkText } 
-          : msg
-      ));
-    }
+  const handleModeChange = (newMode: AppMode) => {
+    setMode(newMode);
+    setMessages([]);
+    setAllFiles([]); // Clear files before fetching new ones
+    setIsShowingFileSearch(false);
+    setIsShowingEditedFiles(false);
+    setEditedFiles(new Map()); // Reset edits on mode change
   };
 
-  const handleCodeGeneration = async (currentMessages: ChatMessage[]) => {
-    setMessages(prev => [...prev, {
-      role: MessageRole.MODEL,
-      content: 'Thinking about the file...',
-      responseType: ResponseType.CODE_GENERATION,
-      modelId: selectedModel
-    }]);
+  const handleToggleFileSearch = () => {
+    setIsShowingFileSearch(prev => !prev);
+    setIsShowingEditedFiles(false);
+  };
+  
+  const handleToggleEditedFiles = () => {
+    setIsShowingEditedFiles(prev => !prev);
+    setIsShowingFileSearch(false);
+  };
 
-    const currentDataset = mode === AppMode.CUSTOM ? customDataset : undefined;
-    const latestQuery = currentMessages[currentMessages.length - 1].content;
-    const searchResults = await searchDocuments(latestQuery, mode, currentDataset);
-    
-    if (searchResults.length === 0) {
-        setMessages(prev => prev.map((msg, index) => 
-          index === prev.length - 1 
-          ? { ...msg, content: "I couldn't find any relevant files to modify for your request." } 
-          : msg
-        ));
-        return;
+  const handleSelectSource = async (source: Source) => {
+    setSelectedFile(source);
+    setSelectedFileContent('Loading...');
+    setSelectedFileViewType(null); // Reset view type
+
+    const content = await elastic.getFileContent(source, mode, mode === AppMode.CUSTOM ? customDataset : undefined);
+    if (content) {
+      setSelectedFileContent(content);
+      const viewType = await gemini.classifyFileContent(content);
+      setSelectedFileViewType(viewType);
+    } else {
+      setSelectedFileContent('Error: Could not load file content.');
     }
-    
-    const modelToUse = MODELS.find(m => m.id === selectedModel)?.model || MODELS[0].model;
-    const responseStream = await streamCodeGenerationResponse(currentMessages, searchResults, modelToUse);
-    let responseJsonText = '';
-    for await (const chunk of responseStream) {
-        responseJsonText += chunk.text;
+  };
+  
+  const handleFilesUploaded = async (fileList: FileList) => {
+    if (mode !== AppMode.CUSTOM) {
+      // Switch to custom mode if files are uploaded
+      handleModeChange(AppMode.CUSTOM);
     }
+    const dataset = await elastic.createDatasetFromFileList(fileList);
+    setCustomDataset(dataset);
+    setMessages([]);
+  };
 
-    try {
-        const responseObject = JSON.parse(responseJsonText);
-        if (responseObject.error) {
-            throw new Error(responseObject.error);
-        }
-        
-        const fullPath = responseObject.filePath;
-        const file = allFiles.find(f => `${f.path}/${f.fileName}` === fullPath);
-        
-        if (!file) {
-            throw new Error(`The model suggested editing a file I couldn't find: ${fullPath}`);
-        }
+  const handleSuggestionAction = async (messageIndex: number, action: 'accepted' | 'rejected') => {
+    const message = messages[messageIndex];
+    if (!message.suggestion) return;
 
-        const originalContent = await getFileContent(file, mode, currentDataset);
-
-        if (originalContent === null) {
-            throw new Error(`Could not fetch original content for ${file.fileName}.`);
-        }
-
-        const suggestion: CodeSuggestion = {
-            file,
-            thought: responseObject.thought,
-            originalContent,
-            suggestedContent: responseObject.newContent,
-            status: 'pending',
+    const updatedSuggestion = { ...message.suggestion, status: action };
+    const updatedMessages = [...messages];
+    updatedMessages[messageIndex] = { ...message, suggestion: updatedSuggestion };
+    
+    if (action === 'accepted') {
+      const { file, suggestedContent, originalContent } = message.suggestion;
+      const success = await elastic.updateFileContent(file, suggestedContent, mode);
+      if(success) {
+        // Record the edit
+        const newRecord: EditedFileRecord = {
+          file,
+          originalContent: editedFiles.get(file.id)?.originalContent ?? originalContent,
+          currentContent: suggestedContent,
         };
-
-        setMessages(prev => prev.map((msg, index) => 
-          index === prev.length - 1
-            ? { ...msg, content: `I have a suggestion for \`${file.fileName}\`. Here are the changes:`, suggestion }
-            : msg
-        ));
-
-    } catch (e) {
-        console.error("Code generation parsing error:", e);
-        let errorMessage = "Sorry, I couldn't generate the edit correctly.";
-        if (e instanceof Error) {
-            errorMessage = e.message;
-        } else if (typeof e === 'object' && e !== null && 'message' in e) {
-            errorMessage = String((e as { message: string }).message);
-        } else if (typeof e === 'string') {
-            errorMessage = e;
-        }
-
-        setMessages(prev => prev.map((msg, index) => 
-          index === prev.length - 1 
-          ? { ...msg, content: errorMessage } 
-          : msg
-        ));
+        setEditedFiles(new Map(editedFiles.set(file.id, newRecord)));
+        
+        updatedMessages[messageIndex].editedFile = file;
+      }
     }
+    
+    setMessages(updatedMessages);
   };
 
-
-  const handleSendMessage = useCallback(async (query: string) => {
-    if (!query.trim() || isLoading) return;
-
+  const handleSendMessage = async (query: string) => {
     setIsLoading(true);
     const userMessage: ChatMessage = { role: MessageRole.USER, content: query };
-    const newMessages = [...messages, userMessage];
-    setMessages(newMessages);
+    const newHistory = [...messages, userMessage];
+    setMessages(newHistory);
+    
+    const modelDefinition = MODELS.find(m => m.id === selectedModel);
+    if (!modelDefinition) {
+      console.error("Selected model not found");
+      setIsLoading(false);
+      return;
+    }
+
+    // Add a placeholder for the model's response
+    setMessages(prev => [...prev, { role: MessageRole.MODEL, content: '', modelId: selectedModel }]);
     
     try {
-      const modelToUse = MODELS.find(m => m.id === selectedModel)?.model || MODELS[0].model;
-      const intent = await classifyIntent(query, modelToUse);
-      console.log("Detected Intent:", intent);
+      // 1. Search for relevant documents
+      const context = await elastic.searchDocuments(query, mode, mode === AppMode.CUSTOM ? customDataset : undefined);
+      
+      // 2. Classify user intent
+      const intent = await gemini.classifyIntent(query, modelDefinition.model);
 
-      switch (intent) {
-        case Intent.GENERATE_CODE:
-            await handleCodeGeneration(newMessages);
-            break;
-        case Intent.CHIT_CHAT:
-            await handleChitChat(newMessages);
-            break;
-        case Intent.QUERY_DOCUMENTS:
-        default:
-            await handleQueryDocuments(newMessages);
-            break;
+      let responseStream;
+      let responseType: ResponseType;
+
+      if (intent === Intent.CHIT_CHAT || (intent === Intent.QUERY_DOCUMENTS && context.length === 0)) {
+        responseType = ResponseType.CHIT_CHAT;
+        responseStream = await gemini.streamChitChatResponse(newHistory, modelDefinition.model);
+      } else if (intent === Intent.GENERATE_CODE && mode !== AppMode.RESEARCH) {
+        responseType = ResponseType.CODE_GENERATION;
+        responseStream = await gemini.streamCodeGenerationResponse(newHistory, context, modelDefinition.model);
+      } else {
+        responseType = ResponseType.RAG;
+        responseStream = await gemini.streamAiResponse(newHistory, context, mode, modelDefinition.model);
+      }
+      
+      // 3. Stream the response
+      let fullResponse = '';
+      if (responseType === ResponseType.CODE_GENERATION) {
+          // Code generation has a different streaming logic because it returns JSON
+          for await (const chunk of responseStream) {
+            fullResponse += chunk.text;
+          }
+          try {
+            const parsedJson = JSON.parse(fullResponse);
+            if (parsedJson.error) {
+              setMessages(prev => {
+                  const lastMsgIndex = prev.length - 1;
+                  const newMessages = [...prev];
+                  newMessages[lastMsgIndex] = {
+                      ...newMessages[lastMsgIndex],
+                      content: `Error: ${parsedJson.error}`,
+                      responseType,
+                  };
+                  return newMessages;
+              });
+            } else {
+              const { filePath, thought, newContent } = parsedJson;
+              const sourceFile = allFiles.find(f => `${f.path}/${f.fileName}` === filePath);
+              if (sourceFile) {
+                const originalContent = await elastic.getFileContent(sourceFile, mode, mode === AppMode.CUSTOM ? customDataset : undefined);
+                if (originalContent) {
+                   const suggestion: CodeSuggestion = {
+                      file: sourceFile,
+                      thought,
+                      originalContent,
+                      suggestedContent: newContent,
+                      status: 'pending',
+                   };
+                   setMessages(prev => {
+                      const lastMsgIndex = prev.length - 1;
+                      const newMessages = [...prev];
+                      newMessages[lastMsgIndex] = {
+                          ...newMessages[lastMsgIndex],
+                          content: `I've prepared a suggestion to modify \`${filePath}\`.`,
+                          suggestion,
+                          responseType,
+                      };
+                      return newMessages;
+                   });
+                }
+              } else {
+                 setMessages(prev => {
+                  const lastMsgIndex = prev.length - 1;
+                  const newMessages = [...prev];
+                  newMessages[lastMsgIndex] = {
+                      ...newMessages[lastMsgIndex],
+                      content: `Error: The model suggested a change for a file that could not be found: \`${filePath}\``,
+                      responseType,
+                  };
+                  return newMessages;
+                });
+              }
+            }
+          } catch(e) {
+            console.error("Error parsing code generation JSON:", e, "Raw content:", fullResponse);
+            setMessages(prev => {
+              const lastMsgIndex = prev.length - 1;
+              const newMessages = [...prev];
+              newMessages[lastMsgIndex] = {
+                  ...newMessages[lastMsgIndex],
+                  content: "Sorry, I encountered an error while generating the code suggestion. The response was not in the expected format.",
+                  responseType,
+              };
+              return newMessages;
+            });
+          }
+      } else {
+        // Handle streaming for RAG and Chit-Chat
+        for await (const chunk of responseStream) {
+          fullResponse += chunk.text;
+          setMessages(prev => {
+            const lastMsgIndex = prev.length - 1;
+            const newMessages = [...prev];
+            newMessages[lastMsgIndex] = {
+              ...newMessages[lastMsgIndex],
+              content: fullResponse,
+              sources: context.map(c => c.source),
+              responseType,
+            };
+            return newMessages;
+          });
+        }
       }
     } catch (error) {
-      console.error('Error processing message:', error);
-      const errorMessageContent = error instanceof Error ? error.message : "An unknown error occurred.";
-      setMessages(prev => [...prev, { role: MessageRole.MODEL, content: `Sorry, I encountered an error: ${errorMessageContent}` }]);
+      console.error("Error sending message:", error);
+      setMessages(prev => {
+        const lastMsgIndex = prev.length - 1;
+        const newMessages = [...prev];
+        newMessages[lastMsgIndex] = {
+            ...newMessages[lastMsgIndex],
+            content: "Sorry, I encountered an error. Please try again.",
+        };
+        return newMessages;
+      });
     } finally {
       setIsLoading(false);
     }
-  }, [isLoading, mode, customDataset, allFiles, messages, selectedModel]);
-  
-  const handleModeChange = useCallback((newMode: AppMode) => {
-    if (newMode === AppMode.CUSTOM) return; 
-    setMode(newMode);
-    setMessages([]);
-    setAllFiles([]);
-  }, []);
+  };
 
-  const handleNewChat = useCallback(() => {
-    setMessages([]);
-  }, []);
-  
-  const handleFilesUploaded = useCallback(async (fileList: FileList) => {
-    if (!fileList || fileList.length === 0) return;
-    setIsLoading(true);
-    try {
-        const newDataset = await createDatasetFromFileList(fileList);
-        setCustomDataset(newDataset);
-        setMode(AppMode.CUSTOM);
-        setMessages([]);
-    } catch (error) {
-        console.error("Error processing uploaded files:", error);
-    } finally {
-        setIsLoading(false);
-    }
-  }, []);
 
-  const handleSuggestionAction = useCallback(async (messageIndex: number, action: 'accepted' | 'rejected') => {
-    // FIX: Deep copy the message to prevent state mutation issues leading to circular dependency errors.
-    const originalMessage = JSON.parse(JSON.stringify(messages[messageIndex]));
-    if (!originalMessage || !originalMessage.suggestion) return;
-
-    originalMessage.suggestion.status = action;
-
-    const newMessages = [...messages];
-    newMessages[messageIndex] = originalMessage;
-    setMessages(newMessages);
-      
-    let followUpMessage: ChatMessage;
-    let file: Source | null = null;
-
-    if (action === 'accepted') {
-        setIsLoading(true);
-        const { originalContent, suggestedContent } = originalMessage.suggestion;
-        file = originalMessage.suggestion.file;
-        try {
-            const success = await updateFileContent(file, suggestedContent, mode);
-            if (!success) {
-              throw new Error("The file could not be found or updated in the mock service.");
-            }
-
-            setEditedFiles(prev => {
-                const newMap = new Map(prev);
-                const existingRecord = newMap.get(file!.id);
-                newMap.set(file!.id, {
-                    file: file!,
-                    originalContent: existingRecord ? existingRecord.originalContent : originalContent,
-                    currentContent: suggestedContent,
-                });
-                return newMap;
-            });
-
-            const updatedFiles = await getAllFiles(mode, mode === AppMode.CUSTOM ? customDataset : undefined);
-            setAllFiles(updatedFiles);
-            followUpMessage = { 
-              role: MessageRole.MODEL, 
-              content: `Great! I've applied the changes to \`${originalMessage.suggestion.file.fileName}\`.`,
-              editedFile: file
-            };
-        } catch(e) {
-            console.error(`Failed to apply suggestion for ${file.fileName}:`, e);
-            const errorMessage = e instanceof Error ? e.message : 'An unknown error occurred.';
-            followUpMessage = { role: MessageRole.MODEL, content: `Sorry, I failed to apply the changes to \`${file.fileName}\`. Reason: ${errorMessage}` };
-        } finally {
-            setIsLoading(false);
-        }
-    } else {
-        followUpMessage = { role: MessageRole.MODEL, content: "Okay, I've discarded the changes." };
-    }
-    setMessages(prev => [...prev, followUpMessage]);
-
-  }, [messages, mode, customDataset]);
-
-  const handleToggleFileSearch = useCallback(() => {
-    setIsFileSearchVisible(prev => !prev);
-    if (isEditedFilesVisible) setIsEditedFilesVisible(false);
-  }, [isEditedFilesVisible]);
-
-  const handleToggleEditedFiles = useCallback(() => {
-    setIsEditedFilesVisible(prev => !prev);
-    if (isFileSearchVisible) setIsFileSearchVisible(false);
-  }, [isFileSearchVisible]);
-
-  const handleViewDiff = useCallback((record: EditedFileRecord) => {
-    setDiffViewerRecord(record);
-  }, []);
-
-  const handleCloseDiffViewer = useCallback(() => {
-      setDiffViewerRecord(null);
-  }, []);
-
-  const handleSelectFile = useCallback(async (file: Source) => {
-    const editedRecord = editedFiles.get(file.id);
-    if (editedRecord) {
-        handleViewDiff(editedRecord);
-    } else {
-        setSelectedFile(file);
-        setSelectedFileContent('Loading...');
-        const currentDataset = mode === AppMode.CUSTOM ? customDataset : undefined;
-        const content = await getFileContent(file, mode, currentDataset);
-        setSelectedFileContent(content ?? 'Could not load file content.');
-
-        if (mode === AppMode.CUSTOM && content) {
-          try {
-            const viewType = await classifyFileContent(content);
-            setSelectedFileViewType(viewType);
-          } catch (error) {
-            console.error("Failed to classify file content:", error);
-            setSelectedFileViewType('document'); 
-          }
-        }
-    }
-  }, [mode, customDataset, editedFiles, handleViewDiff]);
-
-  const handleCloseFileViewer = useCallback(() => {
-    setSelectedFile(null);
-    setSelectedFileContent('');
-    setSelectedFileViewType(null);
-  }, []);
+  // --- Render ---
 
   return (
-    <div className="flex flex-col h-screen bg-slate-900 text-gray-200 font-sans">
+    <div className="bg-slate-950 text-slate-100 h-screen w-screen flex flex-col font-sans">
       <Header 
-        mode={mode}
+        mode={mode} 
         onModeChange={handleModeChange}
-        onNewChat={handleNewChat} 
-        onToggleFileSearch={handleToggleFileSearch} 
+        onNewChat={handleNewChat}
+        onToggleFileSearch={handleToggleFileSearch}
         onFilesUploaded={handleFilesUploaded}
         onToggleEditedFiles={handleToggleEditedFiles}
       />
-      <div className="flex-1 flex overflow-hidden relative">
-        <main className="flex-1 overflow-hidden">
-           <ChatInterface 
-              messages={messages} 
-              isLoading={isLoading} 
-              onSendMessage={handleSendMessage} 
-              onSelectSource={handleSelectFile}
-              mode={mode}
-              isCustomDatasetEmpty={mode === AppMode.CUSTOM && customDataset.length === 0}
-              onFileUpload={handleFilesUploaded}
-              onSuggestionAction={handleSuggestionAction}
-              selectedModel={selectedModel}
-              onModelChange={setSelectedModel}
+      <main className="flex-1 flex overflow-hidden">
+        <div className="flex-1 h-full">
+            <ChatInterface 
+                messages={messages} 
+                isLoading={isLoading} 
+                onSendMessage={handleSendMessage}
+                onSelectSource={handleSelectSource}
+                mode={mode}
+                isCustomDatasetEmpty={mode === AppMode.CUSTOM && customDataset.length === 0}
+                onFileUpload={handleFilesUploaded}
+                onSuggestionAction={handleSuggestionAction}
+                selectedModel={selectedModel}
+                onModelChange={setSelectedModel}
             />
-        </main>
-        
-        <div className={`absolute top-0 right-0 h-full w-full md:w-80 lg:w-96 z-20 transition-transform duration-300 ease-in-out ${isFileSearchVisible ? 'translate-x-0' : 'translate-x-full'}`}>
-          <FileSearch files={allFiles} onClose={handleToggleFileSearch} onSelectFile={handleSelectFile}/>
         </div>
 
-        <div className={`absolute top-0 right-0 h-full w-full md:w-80 lg:w-96 z-20 transition-transform duration-300 ease-in-out ${isEditedFilesVisible ? 'translate-x-0' : 'translate-x-full'}`}>
-          <EditedFilesViewer
-            editedFiles={Array.from(editedFiles.values())}
-            onClose={handleToggleEditedFiles}
-            onSelectFile={handleViewDiff}
-          />
-        </div>
-
-        {selectedFile && (
-          <FileViewer
-            file={selectedFile}
-            content={selectedFileContent}
-            onClose={handleCloseFileViewer}
-            mode={mode}
-            viewType={selectedFileViewType}
-          />
+        {(isShowingFileSearch || isShowingEditedFiles) && (
+          <div className="w-full max-w-sm border-l border-slate-700/50 bg-slate-900 h-full flex-shrink-0">
+            {isShowingFileSearch && (
+              <FileSearch 
+                files={allFiles} 
+                onClose={() => setIsShowingFileSearch(false)}
+                onSelectFile={handleSelectSource}
+              />
+            )}
+            {isShowingEditedFiles && (
+              <EditedFilesViewer
+                editedFiles={Array.from(editedFiles.values())}
+                onClose={() => setIsShowingEditedFiles(false)}
+                onSelectFile={(record) => setSelectedEditedFileRecord(record)}
+              />
+            )}
+          </div>
         )}
+      </main>
+      
+      {selectedFile && (
+        <FileViewer 
+          file={selectedFile}
+          content={selectedFileContent}
+          onClose={() => setSelectedFile(null)}
+          mode={mode}
+          viewType={selectedFileViewType}
+        />
+      )}
 
-        {diffViewerRecord && (
-            <DiffViewerModal
-                record={diffViewerRecord}
-                onClose={handleCloseDiffViewer}
-            />
-        )}
-      </div>
+      {selectedEditedFileRecord && (
+        <DiffViewerModal
+          record={selectedEditedFileRecord}
+          onClose={() => setSelectedEditedFileRecord(null)}
+        />
+      )}
     </div>
   );
 };
